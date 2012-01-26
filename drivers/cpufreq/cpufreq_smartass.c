@@ -877,6 +877,5 @@ module_exit(cpufreq_smartass_exit);
 MODULE_AUTHOR ("Erasmux");
 MODULE_AUTHOR ("AnDyX - fixes for lot of things.");
 MODULE_AUTHOR ("viulian - added support for X10");
-MODULE_AUTHOR ("kenko - added support for toro");
 MODULE_DESCRIPTION ("A smartass cpufreq governor.");
 MODULE_LICENSE ("GPL");
