@@ -41,26 +41,43 @@ struct cpufreq_scaffold_cpuinfo {
 	u64 time_in_idle;
 	u64 idle_exit_time;
 	u64 timer_run_time;
-	int idling;
 	u64 freq_change_time;
 	u64 freq_change_time_in_idle;
 	struct cpufreq_policy *policy;
 	struct cpufreq_frequency_table *freq_table;
 	unsigned int target_freq;
 	int governor_enabled;
+    /* NEW */
+    int cur_cpu_load;
+    unsigned int force_ramp_up;
+    int max_speed;
+    int min_speed;
+	int idling;
+    int suspended;
 };
 
 static DEFINE_PER_CPU(struct cpufreq_scaffold_cpuinfo, cpuinfo);
 
 /* Workqueues handle frequency scaling */
-static struct task_struct *up_task;
+static struct workqueue_struct *up_wq;
 static struct workqueue_struct *down_wq;
-static struct work_struct freq_scale_down_work;
+static struct work_struct freq_scale_work;
 static cpumask_t up_cpumask;
 static spinlock_t up_cpumask_lock;
 static cpumask_t down_cpumask;
 static spinlock_t down_cpumask_lock;
 static struct mutex set_speed_lock;
+
+enum {
+        SCAFFOLD_DEBUG_JUMPS=1,
+        SCAFFOLD_DEBUG_LOAD=2,
+        SCAFFOLD_DEBUG_IDLE=4
+};
+
+/* 
+ * Combination of the above debug flags.
+ */
+static unsigned long debug_mask = 7;
 
 /* Hi speed to bump to from lo speed when load burst (default max) */
 static u64 hispeed_freq;
@@ -205,7 +222,7 @@ static void cpufreq_scaffold_timer(unsigned long data)
          */
 		cpumask_set_cpu(data, &down_cpumask);
 		spin_unlock_irqrestore(&down_cpumask_lock, flags);
-		queue_work(down_wq, &freq_scale_down_work);
+		queue_work(down_wq, &freq_scale_work);
 	} else {
 		pcpu->target_freq = new_freq;
 		spin_lock_irqsave(&up_cpumask_lock, flags);
@@ -395,7 +412,7 @@ static int cpufreq_scaffold_up_task(void *data)
 
 /* Workqueue handler function that was started at __init
  */
-static void cpufreq_scaffold_freq_down(struct work_struct *work)
+static void cpufreq_scaffold_freq_change_time_work(struct work_struct *work)
 {
 	unsigned int cpu;
 	cpumask_t tmp_mask;
@@ -627,7 +644,7 @@ static int cpufreq_governor_scaffold(struct cpufreq_policy *policy,
 			pcpu->idle_exit_time = 0;
 		}
 
-		flush_work(&freq_scale_down_work);
+		flush_work(&freq_scale_work);
 		if (atomic_dec_return(&active_count) > 0)
 			return 0;
 
@@ -648,6 +665,57 @@ static int cpufreq_governor_scaffold(struct cpufreq_policy *policy,
 	return 0;
 }
 
+static void cpufreq_scaffold_suspend(int cpu, int suspend)
+{
+        struct scaffold_info_s *pcpu = &per_cpu(scaffold_info, 
+                                                smp_process_id()); 
+        struct cpufreq_policy *policy = pcpu->cur_policy;
+        unsigned int new_freq;
+
+        if (!pcpu->enable || sleep_max_freq == 0)
+                // disable behaviour for (sleep_max_freq == 0)
+                return;
+        scaffold_update_min_max(pcpu, policy, suspend);
+
+        pcpu->suspended = suspend;
+
+        if (!suspend) {
+                // resume at max speed
+                new_freq = validate_freq(pcpu, sleep_wakeup_freq);
+
+                if (debug_mask & SCAFFOLD_DEBUG_JUMPS)
+                        printk(KERN_INFO "%s: waking up at %d\n", 
+                                __FUNCTION__, new_freq);
+
+                // TODO: CPUFREQ_RELATION_L == ?
+                __cpufreq_driver_target(policy, new_freq, CPUFREQ_RELATION_L);
+
+                if (policy->cur < pcpu->max_speed 
+                        && !timer_pending(&pcpu->timer)) {
+                        reset_timer(smp_processor_id(), pcpu, 
+                                    sample_rate_jiffies);
+                } else {
+                        /* to avoid wakeup issues with quick sleep/wakeup, don't
+                         * change actual frequency when entering sleep to allow
+                         * some time to settle down. We reset the timer, if 
+                         * eventually, even at full load the timer the timer
+                         * will lower the frequency
+                         */
+                        reset_timer(smp_processor_id(), pcpu, 
+                                sample_rate_jiffies);
+
+                        pcpu->freq_change_time_in_idle = 
+                                get_cpu_idle_time_us(
+                                        cpu, &pcpu->freq_change_time);
+
+                        if (debug_mask & SMARTASS_DEBUG_JUMPS)
+                                printk(KERN_INFO "%s: suspending at %d\n",
+                                        __FUNCTION__, policy->cur);
+                }
+        }
+
+}
+
 static int cpufreq_scaffold_idle_notifier(struct notifier_block *nb,
 					     unsigned long val,
 					     void *data)
@@ -665,7 +733,25 @@ static int cpufreq_scaffold_idle_notifier(struct notifier_block *nb,
 }
 
 static struct notifier_block cpufreq_scaffold_idle_nb = {
-	.notifier_call = cpufreq_scaffold_idle_notifier,
+        .notifier_call = cpufreq_scaffold_idle_notifier,
+};
+
+static void scaffold_early_suspend(struct early_suspend *handler) {
+        int i;
+        for_each_online_cpu(i)
+                cpufreq_scaffold_suspend(i,1);
+}
+static void scaffold_late_resume(struct early_suspend *handler) {
+        int i;
+        for_each_online_cpu(i)
+                cpufreq_scaffold_suspend(i,0);
+}
+
+static struct early_suspend cpufreq_scaffold_suspend_nb = {
+        /* TODO: need these functions */
+        .suspend = scaffold_early_suspend,
+        .resume = scaffold_late_resume,
+        .level = EARLY_SUSPEND_LEVEL_DISABLE_FB + 1,
 };
 
 /*
@@ -675,7 +761,6 @@ static int __init cpufreq_scaffold_init(void)
 {
 	unsigned int i;
 	struct cpufreq_scaffold_cpuinfo *pcpu;
-    // Set process/thread execution scheduling priority @ compile time 
 	struct sched_param param = { .sched_priority = MAX_RT_PRIO-1 }; 
 
 	go_hispeed_load = DEFAULT_GO_HISPEED_LOAD;
@@ -693,53 +778,47 @@ static int __init cpufreq_scaffold_init(void)
 		pcpu->cpu_timer.data = i;
 	}
 
-    /* Use wake_up_process to start, run until do_exit or kthread_stop 
-     *
-     * threadfn: cpufreq_scaffold_up_task
-     * data: NULL
-     * namefmt[]: kscaffoldup
-     */
-	up_task = kthread_create(cpufreq_scaffold_up_task, NULL,
-				 "kscaffoldup");
-	if (IS_ERR(up_task))
-		return PTR_ERR(up_task);
-
-    /* kernel thread (up_task) should not inerit our priority or CPU mask
-     *
-     * struct task_struct: up_task
-     * int policy: new policy
-     * sched_param: param
-     */
-	sched_setscheduler_nocheck(up_task, SCHED_FIFO, &param);
-	get_task_struct(up_task);
+    up_wq = alloc_ordered_workqueue("kscaffold_up", WQ_MEM_RECLAIM);
+    if (!up_wq)
+        goto err_freeuptask;
 
 	/* No rescuer thread, bind to CPU queuing the work for possibly
-	   warm cache (probably doesn't matter much). */
+	   warm cache (probably doesn't matter much). 
+       
+       We don't use create_workqueue because it "has no dedicated threads
+       and really just serves as a context for the submission of tasks"
+       [http://lwn.net/Articles/403891/]
+     */
 	down_wq = alloc_workqueue("kscaffold_down", 0, 1);
 
 	if (!down_wq)
 		goto err_freeuptask;
 
-    /* Dynamically init the work queue (freq_scal_down_work) with handler
-     * function (cpufreq_scaffold_freq_down) and argument data (N/A)
-     */
-	INIT_WORK(&freq_scale_down_work,
-		  cpufreq_scaffold_freq_down);
+	INIT_WORK(&freq_scale_work, cpufreq_scaffold_freq_change_time_work);
 
+    /* Adding this from smartass port.
+     * TODO look into this
+     */
+    register_early_suspend(&scaffold_power_suspend);
+
+    printk(KERN_INFO "scaffold: loaded\n");
+
+    /* TODO do we need these
+     */
 	spin_lock_init(&up_cpumask_lock);
 	spin_lock_init(&down_cpumask_lock);
 	mutex_init(&set_speed_lock);
 
-    /* atomic_notifier_chain_register
-     */
+    /* Is this deprecated? 
+     * TODO figure it out
 	idle_notifier_register(&cpufreq_scaffold_idle_nb);
-
-    /* Register yourself with the CPUfreq core
      */
+    register_idle_notifier(&cpufreq_scaffold_idle_nb);
+
 	return cpufreq_register_governor(&cpufreq_gov_scaffold);
 
 err_freeuptask:
-	put_task_struct(up_task);
+    destroy_workqueue(up_wq);
 	return -ENOMEM;
 }
 
@@ -751,9 +830,15 @@ module_init(cpufreq_scaffold_init);
 
 static void __exit cpufreq_scaffold_exit(void)
 {
+    /* TODO what?
+     */
+    struct scaffold_info_s *pcpu = &per_cpu(scaffold_info, 0);
+    pcpu->enable = 0;
+
 	cpufreq_unregister_governor(&cpufreq_gov_scaffold);
-	kthread_stop(up_task);
-	put_task_struct(up_task);
+    unregister_early_suspend(&scaffold_power_suspend);
+
+    destroy_workqueue(up_wq);
 	destroy_workqueue(down_wq);
 }
 
