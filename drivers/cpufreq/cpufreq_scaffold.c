@@ -80,7 +80,7 @@ static unsigned long up_rate_us;
 /*
  * The minimum amount of time to spend at a frequency before we can ramp down.
  */
-#define DEFAULT_DOWN_RATE_US 49000;
+#define DEFAULT_DOWN_RATE_US 24000;
 static unsigned long down_rate_us;
 
 /*
@@ -224,11 +224,11 @@ static void cpufreq_scaffold_timer(unsigned long data)
         unsigned int delta_idle;
         unsigned int delta_time;
         int cpu_load;
-        u64 time_in_idle;
         u64 idle_exit_time;
+        u64 time_in_idle;
+        u64 now_idle;
         struct cpufreq_scaffold_cpuinfo *pcpu = &per_cpu(cpuinfo, data);
         struct cpufreq_policy *policy = pcpu->policy;
-        u64 now_idle;
         unsigned int timer_rate_jiffies = sample_rate_jiffies;
 
         smp_rmb();
@@ -328,6 +328,7 @@ rearm:
                         if (policy->cur == policy->min)
                                 if (pcpu->idling)
                                         goto exit;
+                    printk(KERN_INFO "policy->cur < pcpu->max_speed\n");
                     reset_timer(data, pcpu, timer_rate_jiffies);
                 }
         }
@@ -338,13 +339,18 @@ rearm:
         /* Do not scale down unless we have been at this frequency
          * for the minimum sample time.
          */
-        if (cputime64_sub(pcpu->freq_change_time, pcpu->freq_change_time)
-                < down_rate_us)
+        if (cputime64_sub(pcpu->timer_run_time, pcpu->freq_change_time)
+                < down_rate_us) {
+                printk("%s: timer_run_time=%u, freq_change_time=%u\n",
+                        __FUNCTION__, (unsigned int)pcpu->timer_run_time, 
+                        (unsigned int)pcpu->freq_change_time);
                 goto exit;
+        }
 
         /* Scale down only when there is something to scale down.
          */
         if (cpu_load < min_cpu_load) {
+                printk(KERN_INFO "cpu_load < min_cpu_load\n");
                 cpumask_set_cpu(data, &work_cpumask);
                 queue_work(down_wq, &freq_scale_work);
         }
