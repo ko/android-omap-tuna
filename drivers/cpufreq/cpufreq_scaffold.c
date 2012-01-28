@@ -19,17 +19,16 @@
  *
  */
 
+#include <linux/earlysuspend.h>
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
 #include <linux/cpufreq.h>
-#include <linux/mutex.h>
 #include <linux/sched.h>
 #include <linux/tick.h>
 #include <linux/time.h>
 #include <linux/timer.h>
 #include <linux/workqueue.h>
 #include <linux/kthread.h>
-#include <linux/mutex.h>
 
 #include <asm/cputime.h>
 
@@ -62,11 +61,8 @@ static DEFINE_PER_CPU(struct cpufreq_scaffold_cpuinfo, cpuinfo);
 static struct workqueue_struct *up_wq;
 static struct workqueue_struct *down_wq;
 static struct work_struct freq_scale_work;
-static cpumask_t up_cpumask;
-static spinlock_t up_cpumask_lock;
-static cpumask_t down_cpumask;
-static spinlock_t down_cpumask_lock;
-static struct mutex set_speed_lock;
+static cpumask_t work_cpumask;
+static unsigned int suspended;
 
 enum {
         SCAFFOLD_DEBUG_JUMPS=1,
@@ -74,10 +70,85 @@ enum {
         SCAFFOLD_DEBUG_IDLE=4
 };
 
-/* 
- * Combination of the above debug flags.
- */
+/* Combination of the above debug flags. */
 static unsigned long debug_mask = 7;
+
+/* The minimum amount of time to spend at a frequency before we can ramp up. */
+#define DEFAULT_UP_RATE_US 24000;
+static unsigned long up_rate_us;
+
+/*
+ * The minimum amount of time to spend at a frequency before we can ramp down.
+ */
+#define DEFAULT_DOWN_RATE_US 49000;
+static unsigned long down_rate_us;
+
+/*
+ * When ramping up frequency with no idle cycles jump to at least this frequency.
+ * Zero disables. Set a very high value to jump to policy max freqeuncy.
+ */
+#define DEFAULT_UP_MIN_FREQ 0
+static unsigned int up_min_freq;
+
+/*
+ * When sleep_max_freq>0 the frequency when suspended will be capped
+ * by this frequency. Also will wake up at max frequency of policy
+ * to minimize wakeup issues.
+ * Set sleep_max_freq=0 to disable this behavior.
+ */
+#define DEFAULT_SLEEP_MAX_FREQ 245760
+static unsigned int sleep_max_freq;
+
+/*
+ * The frequency to set when waking up from sleep.
+ * When sleep_max_freq=0 this will have no effect.
+ */
+#define DEFAULT_SLEEP_WAKEUP_FREQ 998400 
+static unsigned int sleep_wakeup_freq;
+
+/*
+ * When awake_min_freq>0 the frequency when not suspended will not
+ * go below this frequency.
+ * Set awake_min_freq=0 to disable this behavior.
+ */
+#define DEFAULT_AWAKE_MIN_FREQ 0
+static unsigned int awake_min_freq;
+
+/* Sampling rate, I highly recommend to leave it at 2. */
+#define DEFAULT_SAMPLE_RATE_JIFFIES 2
+static unsigned int sample_rate_jiffies;
+
+/*
+ * Freqeuncy delta when ramping up.
+ * zero disables and causes to always jump straight to max frequency.
+ */
+#define DEFAULT_RAMP_UP_STEP 220000
+static unsigned int ramp_up_step;
+
+/*
+ * Freqeuncy delta when ramping down.
+ * zero disables and will calculate ramp down according to load heuristic.
+ */
+#define DEFAULT_RAMP_DOWN_STEP 160000
+static unsigned int ramp_down_step;
+
+/*
+ * CPU freq will be increased if measured load > max_cpu_load;
+ */
+#define DEFAULT_MAX_CPU_LOAD 75
+static unsigned long max_cpu_load;
+
+/*
+ * CPU freq will be decreased if measured load < min_cpu_load;
+ */
+#define DEFAULT_MIN_CPU_LOAD 25
+static unsigned long min_cpu_load;
+
+/*
+ * When screen if off behave like conservative governor;
+ */
+#define DEFAULT_SLEEP_RATE_US (usecs_to_jiffies(500000))
+static unsigned long sleep_rate_jiffies;
 
 /* Hi speed to bump to from lo speed when load burst (default max) */
 static u64 hispeed_freq;
@@ -111,156 +182,172 @@ struct cpufreq_governor cpufreq_gov_scaffold = {
 	.owner = THIS_MODULE,
 };
 
+static void scaffold_update_min_max(struct cpufreq_scaffold_cpuinfo *pcpu, 
+                                    struct cpufreq_policy *policy, int suspend) 
+{
+        if (suspend) {
+                pcpu->min_speed = policy->min;
+                pcpu->max_speed = // sleep_max_freq; but make sure 
+                                  // it obeys the policy min/max
+                        policy->max > sleep_max_freq ? 
+                                (sleep_max_freq > policy->min ? 
+                                         sleep_max_freq : policy->min) 
+                                : policy->max;
+        } else {
+                pcpu->min_speed = // awake_min_freq; but make sure 
+                                  // it obeys the policy min/max
+                        policy->min < awake_min_freq ? 
+                                (awake_min_freq < policy->max ? 
+                                        awake_min_freq : policy->max) 
+                                : policy->min;
+                pcpu->max_speed = policy->max;
+        }
+}
+inline static unsigned int validate_freq(struct cpufreq_scaffold_cpuinfo *pcpu, 
+                                        int freq) 
+{
+        if (freq > pcpu->max_speed)
+                return pcpu->max_speed;
+        if (freq < pcpu->min_speed)
+                return pcpu->min_speed;
+        return freq;
+}
+static void reset_timer(unsigned long cpu, 
+                        struct cpufreq_scaffold_cpuinfo *pcpu, 
+                        unsigned int timer_rate_jiffies) 
+{
+        pcpu->time_in_idle = get_cpu_idle_time_us(cpu, &pcpu->idle_exit_time);
+        mod_timer(&pcpu->cpu_timer, jiffies + timer_rate_jiffies);
+}
 static void cpufreq_scaffold_timer(unsigned long data)
 {
-	unsigned int delta_idle;
-	unsigned int delta_time;
-	int cpu_load;
-	int load_since_change;
-	u64 time_in_idle;
-	u64 idle_exit_time;
-	struct cpufreq_scaffold_cpuinfo *pcpu =
-		&per_cpu(cpuinfo, data);
-	u64 now_idle;
-	unsigned int new_freq;
-	unsigned int index;
-	unsigned long flags;
+        unsigned int delta_idle;
+        unsigned int delta_time;
+        int cpu_load;
+        u64 time_in_idle;
+        u64 idle_exit_time;
+        struct cpufreq_scaffold_cpuinfo *pcpu = &per_cpu(cpuinfo, data);
+        struct cpufreq_policy *policy = pcpu->policy;
+        u64 now_idle;
+        unsigned int timer_rate_jiffies = sample_rate_jiffies;
 
-	smp_rmb();
+        smp_rmb();
 
-	if (!pcpu->governor_enabled)
-		goto exit;
+        if (!pcpu->governor_enabled)
+            goto exit;
 
-	/*
-	 * Once pcpu->timer_run_time is updated to >= pcpu->idle_exit_time,
-	 * this lets idle exit know the current idle time sample has
-	 * been processed, and idle exit can generate a new sample and
-	 * re-arm the timer.  This prevents a concurrent idle
-	 * exit on that CPU from writing a new set of info at the same time
-	 * the timer function runs (the timer function can't use that info
-	 * until more time passes).
-	 */
-	time_in_idle = pcpu->time_in_idle;
-	idle_exit_time = pcpu->idle_exit_time;
-	now_idle = get_cpu_idle_time_us(data, &pcpu->timer_run_time);
-	smp_wmb();
-
-	/* If we raced with cancelling a timer, skip. */
-	if (!idle_exit_time)
-		goto exit;
-
-	delta_idle = (unsigned int) cputime64_sub(now_idle, time_in_idle);
-	delta_time = (unsigned int) cputime64_sub(pcpu->timer_run_time,
-						  idle_exit_time);
-
-	/*
-	 * If timer ran less than 1ms after short-term sample started, retry.
-	 */
-	if (delta_time < 1000)
-		goto rearm;
-
-	if (delta_idle > delta_time)
-		cpu_load = 0;
-	else
-		cpu_load = 100 * (delta_time - delta_idle) / delta_time;
-
-	delta_idle = (unsigned int) cputime64_sub(now_idle,
-						pcpu->freq_change_time_in_idle);
-	delta_time = (unsigned int) cputime64_sub(pcpu->timer_run_time,
-						  pcpu->freq_change_time);
-
-	if ((delta_time == 0) || (delta_idle > delta_time))
-		load_since_change = 0;
-	else
-		load_since_change =
-			100 * (delta_time - delta_idle) / delta_time;
-
-	/*
-	 * Choose greater of short-term load (since last idle timer
-	 * started or timer function re-armed itself) or long-term load
-	 * (since last frequency change).
-	 */
-	if (load_since_change > cpu_load)
-		cpu_load = load_since_change;
-
-	if (cpu_load >= go_hispeed_load) {
-		if (pcpu->policy->cur == pcpu->policy->min)
-			new_freq = hispeed_freq;
-		else
-			new_freq = pcpu->policy->max * cpu_load / 100;
-	} else {
-		new_freq = pcpu->policy->cur * cpu_load / 100;
-	}
-
-	if (cpufreq_frequency_table_target(pcpu->policy, pcpu->freq_table,
-					   new_freq, CPUFREQ_RELATION_H,
-					   &index)) {
-		pr_warn_once("timer %d: cpufreq_frequency_table_target error\n",
-			     (int) data);
-		goto rearm;
-	}
-
-	new_freq = pcpu->freq_table[index].frequency;
-
-	if (pcpu->target_freq == new_freq)
-		goto rearm_if_notmax;
-
-	/*
-	 * Do not scale down unless we have been at this frequency for the
-	 * minimum sample time.
-	 */
-	if (new_freq < pcpu->target_freq) {
-		if (cputime64_sub(pcpu->timer_run_time, pcpu->freq_change_time)
-		    < min_sample_time)
-			goto rearm;
-	}
-
-	if (new_freq < pcpu->target_freq) {
-		pcpu->target_freq = new_freq;
-		spin_lock_irqsave(&down_cpumask_lock, flags);
-        /* TODO down_cpumask
+        /*
+         * Once pcpu->timer_run_time is updated to >= pcpu->idle_exit_time,
+         * this lets idle exit know the current idle time sample has
+         * been processed, and idle exit can generate a new sample and
+         * re-arm the timer.  This prevents a concurrent idle
+         * exit on that CPU from writing a new set of info at the same time
+         * the timer function runs (the timer function can't use that info
+         * until more time passes).
          */
-		cpumask_set_cpu(data, &down_cpumask);
-		spin_unlock_irqrestore(&down_cpumask_lock, flags);
-		queue_work(down_wq, &freq_scale_work);
-	} else {
-		pcpu->target_freq = new_freq;
-		spin_lock_irqsave(&up_cpumask_lock, flags);
-		cpumask_set_cpu(data, &up_cpumask);
-		spin_unlock_irqrestore(&up_cpumask_lock, flags);
-		wake_up_process(up_task);
-	}
+        time_in_idle = pcpu->time_in_idle;
+        idle_exit_time = pcpu->idle_exit_time;
+        now_idle = get_cpu_idle_time_us(data, &pcpu->timer_run_time);
+        smp_wmb();
 
-rearm_if_notmax:
-	/*
-	 * Already set max speed and don't see a need to change that,
-	 * wait until next idle to re-evaluate, don't need timer.
-	 */
-	if (pcpu->target_freq == pcpu->policy->max)
-		goto exit;
+        /* If we raced with cancelling a timer, skip. */
+        if (!idle_exit_time)
+            goto exit;
 
+        /* Screen is off so we can be more relaxed. */
+        if (pcpu->suspended && policy->cur == policy->min)
+            timer_rate_jiffies = sleep_rate_jiffies;
+
+        delta_idle = (unsigned int) cputime64_sub(now_idle, time_in_idle);
+        delta_time = (unsigned int) cputime64_sub(pcpu->timer_run_time,
+                              idle_exit_time);
+
+        if (debug_mask & SCAFFOLD_DEBUG_IDLE)
+            printk(KERN_INFO "%s: t=%u i=%u\n",
+                    __FUNCTION__, delta_time, delta_idle);
+
+        /*
+         * If timer ran less than 1ms after short-term sample started, retry.
+         */
+        if (delta_time < 1000)
+            goto rearm;
+
+        if (delta_idle > delta_time)
+            cpu_load = 0;
+        else
+            cpu_load = 100 * (delta_time - delta_idle) / delta_time;
+
+        if (debug_mask & SCAFFOLD_DEBUG_LOAD)
+            printk(KERN_INFO "%s: cur=%d, load=%d, delta_time=%u)\n",
+                    __FUNCTION__, policy->cur, cpu_load, delta_time);
+
+        pcpu->cur_cpu_load = cpu_load;
+
+        /* Scale up if load > max || if there were no idle cycles since
+         * coming out of idle || we are above our max speed for a very
+         * long time (should only happen if entering sleep at high loads)
+         */
+        if (cpu_load > max_cpu_load || delta_idle == 0) {
+                if (!(policy->cur > pcpu->max_speed &&
+                        cputime64_sub(pcpu->timer_run_time,
+                                pcpu->freq_change_time)
+                        > 100 * down_rate_us)) {
+                        
+                    if (policy->cur > pcpu->max_speed)
+                            reset_timer(data, pcpu, timer_rate_jiffies);
+                    if (policy->cur == policy->max)
+                            goto exit;
+                    if (cputime64_sub(pcpu->freq_change_time, 
+                                pcpu->freq_change_time) < up_rate_us)
+                            goto exit;
+
+                    pcpu->force_ramp_up = 1;
+                    cpumask_set_cpu(data, &work_cpumask);
+                    queue_work(up_wq, &freq_scale_work);
+                    goto exit;
+                }
+                        
+        }
+
+        /* There is a window where if the cpu utilization can go from
+         * low to high between the timer expiring, delta_idle will be
+         * > 0 and the cpu will be 100% busy, preventing idle from
+         * running, and this timer from firing. So setup another timer
+         * to fire to check cpu utilization. Do not setup the timer
+         * if there is no scheduled work or if at max speed.
+         */
 rearm:
-	if (!timer_pending(&pcpu->cpu_timer)) {
-		/*
-		 * If already at min: if that CPU is idle, don't set timer.
-		 * Else cancel the timer if that CPU goes idle.  We don't
-		 * need to re-evaluate speed until the next idle exit.
-		 */
-		if (pcpu->target_freq == pcpu->policy->min) {
-			smp_rmb();
+        if (!timer_pending(&pcpu->cpu_timer)) {
+                /* If already at min and cpu is idle, don't
+                 * set the timer. Else cancel the timer if
+                 * the CPU goes idle. We don't need to re-evaluate
+                 * speed until the next idle exit.
+                 */
 
-			if (pcpu->idling)
-				goto exit;
+                if (policy->cur < pcpu->max_speed) {
+                        if (policy->cur == policy->min)
+                                if (pcpu->idling)
+                                        goto exit;
+                    reset_timer(data, pcpu, timer_rate_jiffies);
+                }
+        }
 
-			pcpu->timer_idlecancel = 1;
-		}
+        if (policy->cur == policy->min)
+                goto exit;
 
-		pcpu->time_in_idle = get_cpu_idle_time_us(
-			data, &pcpu->idle_exit_time);
-		mod_timer(&pcpu->cpu_timer,
-			  jiffies + usecs_to_jiffies(timer_rate));
-	}
+        /* Do not scale down unless we have been at this frequency
+         * for the minimum sample time.
+         */
+        if (cputime64_sub(pcpu->freq_change_time, pcpu->freq_change_time)
+                < down_rate_us)
+                goto exit;
 
+        /* Scale down only when there is something to scale down.
+         */
+        if (cpu_load < min_cpu_load) {
+                cpumask_set_cpu(data, &work_cpumask);
+                queue_work(down_wq, &freq_scale_work);
+        }
 exit:
 	return;
 }
@@ -269,7 +356,9 @@ static void cpufreq_scaffold_idle_start(void)
 {
 	struct cpufreq_scaffold_cpuinfo *pcpu =
 		&per_cpu(cpuinfo, smp_processor_id());
+    struct cpufreq_policy *policy = pcpu->policy;
 	int pending;
+    unsigned int timer_rate_jiffies = sample_rate_jiffies;
 
 	if (!pcpu->governor_enabled)
 		return;
@@ -295,6 +384,11 @@ static void cpufreq_scaffold_idle_start(void)
 			mod_timer(&pcpu->cpu_timer,
 				  jiffies + usecs_to_jiffies(timer_rate));
 		}
+        if (!timer_pending(&pcpu->cpu_timer)) {
+            if (pcpu->suspended && policy->cur == policy->min)
+                    timer_rate_jiffies = sleep_rate_jiffies;
+            reset_timer(smp_processor_id(), pcpu, timer_rate_jiffies);
+        }
 #endif
 	} else {
 		/*
@@ -349,123 +443,313 @@ static void cpufreq_scaffold_idle_end(void)
 
 }
 
-static int cpufreq_scaffold_up_task(void *data)
-{
-	unsigned int cpu;
-	cpumask_t tmp_mask;
-	unsigned long flags;
-	struct cpufreq_scaffold_cpuinfo *pcpu;
-
-	while (1) {
-		set_current_state(TASK_INTERRUPTIBLE);
-		spin_lock_irqsave(&up_cpumask_lock, flags);
-
-		if (cpumask_empty(&up_cpumask)) {
-			spin_unlock_irqrestore(&up_cpumask_lock, flags);
-			schedule();
-
-			if (kthread_should_stop())
-				break;
-
-			spin_lock_irqsave(&up_cpumask_lock, flags);
-		}
-
-		set_current_state(TASK_RUNNING);
-		tmp_mask = up_cpumask;
-		cpumask_clear(&up_cpumask);
-		spin_unlock_irqrestore(&up_cpumask_lock, flags);
-
-		for_each_cpu(cpu, &tmp_mask) {
-			unsigned int j;
-			unsigned int max_freq = 0;
-
-			pcpu = &per_cpu(cpuinfo, cpu);
-			smp_rmb();
-
-			if (!pcpu->governor_enabled)
-				continue;
-
-			mutex_lock(&set_speed_lock);
-
-			for_each_cpu(j, pcpu->policy->cpus) {
-				struct cpufreq_scaffold_cpuinfo *pjcpu =
-					&per_cpu(cpuinfo, j);
-
-				if (pjcpu->target_freq > max_freq)
-					max_freq = pjcpu->target_freq;
-			}
-
-			if (max_freq != pcpu->policy->cur)
-				__cpufreq_driver_target(pcpu->policy,
-							max_freq,
-							CPUFREQ_RELATION_H);
-			mutex_unlock(&set_speed_lock);
-
-			pcpu->freq_change_time_in_idle =
-				get_cpu_idle_time_us(cpu,
-						     &pcpu->freq_change_time);
-		}
-	}
-
-	return 0;
-}
-
-/* Workqueue handler function that was started at __init
- */
+/* We use the same work function to scale up and down */
 static void cpufreq_scaffold_freq_change_time_work(struct work_struct *work)
 {
-	unsigned int cpu;
-	cpumask_t tmp_mask;
-	unsigned long flags;
-	struct cpufreq_scaffold_cpuinfo *pcpu;
+        unsigned int cpu;
+        int freq_new;
+        unsigned force_ramp_up;
+        int cpu_load;
+        struct cpufreq_scaffold_cpuinfo *pcpu;
+        struct cpufreq_policy *policy; 
+        unsigned int relation = CPUFREQ_RELATION_L;
+        cpumask_t tmp_mask = work_cpumask;
+        const cpumask_t * ptmp_mask = &tmp_mask;
 
-    /* Save current state of local interrupts,
-     * disables local interrupts,
-     * acquires lock
-     */
-	spin_lock_irqsave(&down_cpumask_lock, flags);
-	tmp_mask = down_cpumask;
-	cpumask_clear(&down_cpumask);
-	spin_unlock_irqrestore(&down_cpumask_lock, flags);
+        for_each_cpu(cpu, ptmp_mask) {
+                pcpu = &per_cpu(cpuinfo, cpu);
+                policy = pcpu->policy;
+                cpu_load = pcpu->cur_cpu_load;
+                force_ramp_up = pcpu->force_ramp_up;
+                pcpu->force_ramp_up = 0;
 
-    /* for ((cpu) = 0; (cpu) < 1; (cpu)++, (void)mask)
-     */
-	for_each_cpu(cpu, &tmp_mask) {
-		unsigned int j;
-		unsigned int max_freq = 0;
+                smp_rmb();
 
-		pcpu = &per_cpu(cpuinfo, cpu);
-        /* commit all pending loads before continuing
-         * thanks
-         */
-		smp_rmb();
+                if (!pcpu->governor_enabled)
+                    continue;
 
-		if (!pcpu->governor_enabled)
-			continue;
+                if (force_ramp_up || cpu_load > max_cpu_load) {
+                        if (force_ramp_up && up_min_freq) {
+                                freq_new = up_min_freq;
+                                relation = CPUFREQ_RELATION_L;
+                        } else if (ramp_up_step) {
+                                freq_new = policy->cur + ramp_up_step;
+                                relation = CPUFREQ_RELATION_H;
+                        } else {
+                                freq_new = pcpu->max_speed;
+                                relation = CPUFREQ_RELATION_H;
+                        }
+                } else if (cpu_load < min_cpu_load) {
+                        if (ramp_down_step)
+                                freq_new = policy->cur - ramp_down_step;
+                        else {
+                                cpu_load += 100 - max_cpu_load; // dummy load ?
+                                freq_new = policy->cur * cpu_load / 100;
+                        } 
+                        relation = CPUFREQ_RELATION_L;
+                } else {
+                        freq_new = policy->cur;
+                }
 
-		mutex_lock(&set_speed_lock);
+                freq_new = validate_freq(pcpu, freq_new);
 
-        /* for (j = 0; j < 1; j++, (void)(pcpu->policy->cpus))
-         */
-		for_each_cpu(j, pcpu->policy->cpus) {
-			struct cpufreq_scaffold_cpuinfo *pjcpu =
-				&per_cpu(cpuinfo, j);
+                if (freq_new != policy->cur) {
+                        if (debug_mask & SCAFFOLD_DEBUG_JUMPS)
+                                printk(KERN_INFO "%s: jumping from %d to %d\n",
+                                        __FUNCTION__, policy->cur, freq_new);
 
-			if (pjcpu->target_freq > max_freq)
-				max_freq = pjcpu->target_freq;
-		}
+                        __cpufreq_driver_target(policy, freq_new, relation);
 
-		if (max_freq != pcpu->policy->cur)
-			__cpufreq_driver_target(pcpu->policy, max_freq,
-						CPUFREQ_RELATION_H);
+                        pcpu->freq_change_time_in_idle = 
+                                get_cpu_idle_time_us(cpu,
+                                        &pcpu->freq_change_time);
+                }
 
-		mutex_unlock(&set_speed_lock);
-		pcpu->freq_change_time_in_idle =
-			get_cpu_idle_time_us(cpu,
-					     &pcpu->freq_change_time);
-	}
+                cpumask_clear_cpu(cpu, &work_cpumask);
+        }
 }
 
+/*
+ * Mutators for debug_mask
+ */
+static ssize_t show_debug_mask(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%lu\n", debug_mask);
+}
+
+static ssize_t 
+store_debug_mask(struct cpufreq_policy *policy, const char *buf, size_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0)
+                debug_mask = input;
+        return res;
+}
+
+static struct freq_attr debug_mask_attr = __ATTR(debug_mask, 0644,
+        show_debug_mask, store_debug_mask);
+
+/* Mutators for up_rate_us */
+static ssize_t show_up_rate_us(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%lu\n", up_rate_us);
+}
+static ssize_t store_up_rate_us(struct cpufreq_policy *policy, 
+                                const char *buf, ssize_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input >= 0 && input <= 100000000)
+                up_rate_us = input;
+        return res;
+}
+static struct freq_attr up_rate_us_attr = __ATTR(up_rate_us, 0644,
+        show_up_rate_us, store_up_rate_us);
+
+/* Mutators for down_rate_us */
+static ssize_t show_down_rate_us(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%lu\n", down_rate_us);
+}
+static ssize_t store_down_rate_us(struct cpufreq_policy *policy, 
+                                const char *buf, ssize_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input >= 0 && input <= 100000000)
+                down_rate_us = input;
+        return res;
+}
+static struct freq_attr down_rate_us_attr = __ATTR(down_rate_us, 0644,
+                show_down_rate_us, store_down_rate_us);
+
+/* Mutators for up_min_freq */
+static ssize_t show_up_min_freq(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%u\n", up_min_freq);
+}
+static ssize_t store_up_min_freq(struct cpufreq_policy *policy, 
+                                const char *buf, ssize_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input >= 0)
+          up_min_freq = input;
+        return res;
+}
+static struct freq_attr up_min_freq_attr = __ATTR(up_min_freq, 0644,
+                show_up_min_freq, store_up_min_freq);
+
+/* Mutators for sleep_max_freq */
+static ssize_t show_sleep_max_freq(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%u\n", sleep_max_freq);
+}
+static ssize_t store_sleep_max_freq(struct cpufreq_policy *policy, 
+                                    const char *buf, size_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input >= 0)
+          sleep_max_freq = input;
+        return res;
+}
+static struct freq_attr sleep_max_freq_attr = __ATTR(sleep_max_freq, 0644,
+                show_sleep_max_freq, store_sleep_max_freq);
+
+/* Mutators for sleep_wakeup_freq */
+static ssize_t show_sleep_wakeup_freq(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%u\n", sleep_wakeup_freq);
+}
+static ssize_t store_sleep_wakeup_freq(struct cpufreq_policy *policy, 
+                                        const char *buf, size_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input >= 0)
+          sleep_wakeup_freq = input;
+        return res;
+}
+static struct freq_attr sleep_wakeup_freq_attr = __ATTR(sleep_wakeup_freq, 0644,
+                show_sleep_wakeup_freq, store_sleep_wakeup_freq);
+
+/* Mutators awake_min_freq */
+static ssize_t show_awake_min_freq(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%u\n", awake_min_freq);
+}
+static ssize_t store_awake_min_freq(struct cpufreq_policy *policy, 
+                                    const char *buf, size_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input >= 0)
+          awake_min_freq = input;
+        return res;
+}
+static struct freq_attr awake_min_freq_attr = __ATTR(awake_min_freq, 0644,
+                show_awake_min_freq, store_awake_min_freq);
+
+/* Mutators sample_rate_jiffies */
+static ssize_t show_sample_rate_jiffies(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%u\n", sample_rate_jiffies);
+}
+
+static ssize_t store_sample_rate_jiffies(struct cpufreq_policy *policy, 
+                                        const char *buf, size_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input > 0 && input <= 1000)
+          sample_rate_jiffies = input;
+        return res;
+}
+static struct freq_attr sample_rate_jiffies_attr = __ATTR(sample_rate_jiffies, 0644,
+                show_sample_rate_jiffies, store_sample_rate_jiffies);
+
+/* Mutators ramp_up_step */
+static ssize_t show_ramp_up_step(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%u\n", ramp_up_step);
+}
+static ssize_t store_ramp_up_step(struct cpufreq_policy *policy, 
+                                const char *buf, size_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input >= 0)
+          ramp_up_step = input;
+        return res;
+}
+static struct freq_attr ramp_up_step_attr = __ATTR(ramp_up_step, 0644,
+                show_ramp_up_step, store_ramp_up_step);
+
+/* Mutators ramp_down_step */
+static ssize_t show_ramp_down_step(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%u\n", ramp_down_step);
+}
+static ssize_t store_ramp_down_step(struct cpufreq_policy *policy, 
+                                    const char *buf, size_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input >= 0)
+          ramp_down_step = input;
+        return res;
+}
+static struct freq_attr ramp_down_step_attr = __ATTR(ramp_down_step, 0644,
+                show_ramp_down_step, store_ramp_down_step);
+
+/* Mutators max_cpu_load */
+static ssize_t show_max_cpu_load(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%lu\n", max_cpu_load);
+}
+static ssize_t store_max_cpu_load(struct cpufreq_policy *policy, 
+                                const char *buf, size_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input > 0 && input <= 100)
+          max_cpu_load = input;
+        return res;
+}
+static struct freq_attr max_cpu_load_attr = __ATTR(max_cpu_load, 0644,
+                show_max_cpu_load, store_max_cpu_load);
+
+/* Mutators min_cpu_load */
+static ssize_t show_min_cpu_load(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%lu\n", min_cpu_load);
+}
+static ssize_t store_min_cpu_load(struct cpufreq_policy *policy, 
+                                const char *buf, size_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input > 0 && input < 100)
+          min_cpu_load = input;
+        return res;
+}
+static struct freq_attr min_cpu_load_attr = __ATTR(min_cpu_load, 0644,
+                show_min_cpu_load, store_min_cpu_load);
+
+/* Mutators sleep_rate_us */
+static ssize_t show_sleep_rate_us(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%lu\n", (long)jiffies_to_usecs(sleep_rate_jiffies));
+}
+static ssize_t store_sleep_rate_us(struct cpufreq_policy *policy, 
+                                const char *buf, size_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input >= 50000 && input <= 1000000)
+          sleep_rate_jiffies = usecs_to_jiffies(input);
+        return res;
+}
+static struct freq_attr sleep_rate_us_attr = __ATTR(sleep_rate_us, 0644,
+                show_sleep_rate_us, store_sleep_rate_us);
+
+
+/* Mutators for hispeed_freq */
 static ssize_t show_hispeed_freq(struct kobject *kobj,
 				 struct attribute *attr, char *buf)
 {
@@ -490,6 +774,7 @@ static struct global_attr hispeed_freq_attr = __ATTR(hispeed_freq, 0644,
 		show_hispeed_freq, store_hispeed_freq);
 
 
+/* Mutators for go_hispeed_load */
 static ssize_t show_go_hispeed_load(struct kobject *kobj,
 				     struct attribute *attr, char *buf)
 {
@@ -512,6 +797,7 @@ static ssize_t store_go_hispeed_load(struct kobject *kobj,
 static struct global_attr go_hispeed_load_attr = __ATTR(go_hispeed_load, 0644,
 		show_go_hispeed_load, store_go_hispeed_load);
 
+/* Mutators for min_sample_time */
 static ssize_t show_min_sample_time(struct kobject *kobj,
 				struct attribute *attr, char *buf)
 {
@@ -534,6 +820,7 @@ static ssize_t store_min_sample_time(struct kobject *kobj,
 static struct global_attr min_sample_time_attr = __ATTR(min_sample_time, 0644,
 		show_min_sample_time, store_min_sample_time);
 
+/* Mutators for timer_rate */
 static ssize_t show_timer_rate(struct kobject *kobj,
 			struct attribute *attr, char *buf)
 {
@@ -557,6 +844,21 @@ static struct global_attr timer_rate_attr = __ATTR(timer_rate, 0644,
 		show_timer_rate, store_timer_rate);
 
 static struct attribute *scaffold_attributes[] = {
+    &debug_mask_attr.attr,
+    &up_rate_us_attr.attr,
+    &down_rate_us_attr.attr,
+    &up_min_freq_attr.attr,
+    &sleep_max_freq_attr.attr,
+    &sleep_wakeup_freq_attr.attr,
+    &awake_min_freq_attr.attr,
+    &sample_rate_jiffies_attr.attr,
+    &ramp_up_step_attr.attr,
+    &ramp_down_step_attr.attr,
+    &max_cpu_load_attr.attr,
+    &min_cpu_load_attr.attr,
+	&sleep_rate_us_attr.attr,
+
+    // interactive
 	&hispeed_freq_attr.attr,
 	&go_hispeed_load_attr.attr,
 	&min_sample_time_attr.attr,
@@ -667,12 +969,12 @@ static int cpufreq_governor_scaffold(struct cpufreq_policy *policy,
 
 static void cpufreq_scaffold_suspend(int cpu, int suspend)
 {
-        struct scaffold_info_s *pcpu = &per_cpu(scaffold_info, 
-                                                smp_process_id()); 
-        struct cpufreq_policy *policy = pcpu->cur_policy;
+        struct cpufreq_scaffold_cpuinfo *pcpu = &per_cpu(cpuinfo, 
+                                                smp_processor_id()); 
+        struct cpufreq_policy *policy = pcpu->policy;
         unsigned int new_freq;
 
-        if (!pcpu->enable || sleep_max_freq == 0)
+        if (!pcpu->governor_enabled || sleep_max_freq == 0)
                 // disable behaviour for (sleep_max_freq == 0)
                 return;
         scaffold_update_min_max(pcpu, policy, suspend);
@@ -691,7 +993,7 @@ static void cpufreq_scaffold_suspend(int cpu, int suspend)
                 __cpufreq_driver_target(policy, new_freq, CPUFREQ_RELATION_L);
 
                 if (policy->cur < pcpu->max_speed 
-                        && !timer_pending(&pcpu->timer)) {
+                        && !timer_pending(&pcpu->cpu_timer)) {
                         reset_timer(smp_processor_id(), pcpu, 
                                     sample_rate_jiffies);
                 } else {
@@ -708,7 +1010,7 @@ static void cpufreq_scaffold_suspend(int cpu, int suspend)
                                 get_cpu_idle_time_us(
                                         cpu, &pcpu->freq_change_time);
 
-                        if (debug_mask & SMARTASS_DEBUG_JUMPS)
+                        if (debug_mask & SCAFFOLD_DEBUG_JUMPS)
                                 printk(KERN_INFO "%s: suspending at %d\n",
                                         __FUNCTION__, policy->cur);
                 }
@@ -736,6 +1038,7 @@ static struct notifier_block cpufreq_scaffold_idle_nb = {
         .notifier_call = cpufreq_scaffold_idle_notifier,
 };
 
+
 static void scaffold_early_suspend(struct early_suspend *handler) {
         int i;
         for_each_online_cpu(i)
@@ -746,12 +1049,11 @@ static void scaffold_late_resume(struct early_suspend *handler) {
         for_each_online_cpu(i)
                 cpufreq_scaffold_suspend(i,0);
 }
-
 static struct early_suspend cpufreq_scaffold_suspend_nb = {
         /* TODO: need these functions */
         .suspend = scaffold_early_suspend,
         .resume = scaffold_late_resume,
-        .level = EARLY_SUSPEND_LEVEL_DISABLE_FB + 1,
+        .level = 150 + 1
 };
 
 /*
@@ -759,67 +1061,75 @@ static struct early_suspend cpufreq_scaffold_suspend_nb = {
  */
 static int __init cpufreq_scaffold_init(void)
 {
-	unsigned int i;
-	struct cpufreq_scaffold_cpuinfo *pcpu;
-	struct sched_param param = { .sched_priority = MAX_RT_PRIO-1 }; 
+        unsigned int i;
+        struct cpufreq_scaffold_cpuinfo *pcpu;
 
-	go_hispeed_load = DEFAULT_GO_HISPEED_LOAD;
-	min_sample_time = DEFAULT_MIN_SAMPLE_TIME;
-	timer_rate = DEFAULT_TIMER_RATE;
+        up_rate_us = DEFAULT_UP_RATE_US;
+        down_rate_us = DEFAULT_DOWN_RATE_US;
+        up_min_freq = DEFAULT_UP_MIN_FREQ;
+        sleep_max_freq = DEFAULT_SLEEP_MAX_FREQ;
+        sleep_wakeup_freq = DEFAULT_SLEEP_WAKEUP_FREQ;
+        awake_min_freq = DEFAULT_AWAKE_MIN_FREQ;
+        sample_rate_jiffies = DEFAULT_SAMPLE_RATE_JIFFIES;
+        ramp_up_step = DEFAULT_RAMP_UP_STEP;
+        ramp_down_step = DEFAULT_RAMP_DOWN_STEP;
+        max_cpu_load = DEFAULT_MAX_CPU_LOAD;
+        min_cpu_load = DEFAULT_MIN_CPU_LOAD;
+        sleep_rate_jiffies = DEFAULT_SLEEP_RATE_US;
 
-	/* Initalize per-cpu timers */
-	for_each_possible_cpu(i) {
-        // Maintain a per-cpu area prevents cache line bouncing 
-		pcpu = &per_cpu(cpuinfo, i);
+        suspended = 0;
 
-        // don't wake up the kernel just for this
-		init_timer_deferrable(&pcpu->cpu_timer);
-		pcpu->cpu_timer.function = cpufreq_scaffold_timer;
-		pcpu->cpu_timer.data = i;
-	}
+        go_hispeed_load = DEFAULT_GO_HISPEED_LOAD;
+        min_sample_time = DEFAULT_MIN_SAMPLE_TIME;
+        timer_rate = DEFAULT_TIMER_RATE;
 
-    up_wq = alloc_ordered_workqueue("kscaffold_up", WQ_MEM_RECLAIM);
-    if (!up_wq)
-        goto err_freeuptask;
+        /* Initalize per-cpu timers */
+        for_each_possible_cpu(i) {
+                // Maintain a per-cpu area prevents cache line bouncing 
+                pcpu = &per_cpu(cpuinfo, i);
 
-	/* No rescuer thread, bind to CPU queuing the work for possibly
-	   warm cache (probably doesn't matter much). 
-       
-       We don't use create_workqueue because it "has no dedicated threads
-       and really just serves as a context for the submission of tasks"
-       [http://lwn.net/Articles/403891/]
-     */
-	down_wq = alloc_workqueue("kscaffold_down", 0, 1);
+                // don't wake up the kernel just for this
+                init_timer_deferrable(&pcpu->cpu_timer);
+                pcpu->cpu_timer.function = cpufreq_scaffold_timer;
+                pcpu->cpu_timer.data = i;
+        }
 
-	if (!down_wq)
-		goto err_freeuptask;
+        up_wq = alloc_ordered_workqueue("kscaffold_up", WQ_MEM_RECLAIM);
+        if (!up_wq)
+                goto err_freeuptask;
 
-	INIT_WORK(&freq_scale_work, cpufreq_scaffold_freq_change_time_work);
+        /* No rescuer thread, bind to CPU queuing the work for possibly
+           warm cache (probably doesn't matter much). 
+           
+           We don't use create_workqueue because it "has no dedicated threads
+           and really just serves as a context for the submission of tasks"
+           [http://lwn.net/Articles/403891/]
+         */
+        down_wq = alloc_workqueue("kscaffold_down", 0, 1);
 
-    /* Adding this from smartass port.
-     * TODO look into this
-     */
-    register_early_suspend(&scaffold_power_suspend);
+        if (!down_wq)
+                goto err_freeuptask;
 
-    printk(KERN_INFO "scaffold: loaded\n");
+        INIT_WORK(&freq_scale_work, cpufreq_scaffold_freq_change_time_work);
 
-    /* TODO do we need these
-     */
-	spin_lock_init(&up_cpumask_lock);
-	spin_lock_init(&down_cpumask_lock);
-	mutex_init(&set_speed_lock);
+        /* Adding this from smartass port.
+         * TODO look into this
+         */
+        register_early_suspend(&cpufreq_scaffold_suspend_nb);
 
-    /* Is this deprecated? 
-     * TODO figure it out
-	idle_notifier_register(&cpufreq_scaffold_idle_nb);
-     */
-    register_idle_notifier(&cpufreq_scaffold_idle_nb);
+        printk(KERN_INFO "scaffold: loaded\n");
 
-	return cpufreq_register_governor(&cpufreq_gov_scaffold);
+        /* Is this deprecated? 
+         * TODO figure it out
+        register_idle_notifier(&cpufreq_scaffold_idle_nb);
+         */
+        idle_notifier_register(&cpufreq_scaffold_idle_nb);
+
+        return cpufreq_register_governor(&cpufreq_gov_scaffold);
 
 err_freeuptask:
-    destroy_workqueue(up_wq);
-	return -ENOMEM;
+        destroy_workqueue(up_wq);
+        return -ENOMEM;
 }
 
 #ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_scaffold
@@ -832,11 +1142,11 @@ static void __exit cpufreq_scaffold_exit(void)
 {
     /* TODO what?
      */
-    struct scaffold_info_s *pcpu = &per_cpu(scaffold_info, 0);
-    pcpu->enable = 0;
+    struct cpufreq_scaffold_cpuinfo *pcpu = &per_cpu(cpuinfo, 0);
+    pcpu->governor_enabled = 0;
 
 	cpufreq_unregister_governor(&cpufreq_gov_scaffold);
-    unregister_early_suspend(&scaffold_power_suspend);
+    unregister_early_suspend(&cpufreq_scaffold_suspend_nb);
 
     destroy_workqueue(up_wq);
 	destroy_workqueue(down_wq);
