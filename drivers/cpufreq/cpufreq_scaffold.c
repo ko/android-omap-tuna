@@ -72,7 +72,7 @@ enum {
 };
 
 /* Combination of the above debug flags. */
-#define DEFAULT_DEBUG_MASK 0;
+#define DEFAULT_DEBUG_MASK 1;
 static unsigned long debug_mask;
 
 /* The minimum amount of time to spend at a frequency before we can ramp up. */
@@ -124,14 +124,14 @@ static unsigned int sample_rate_jiffies;
  * Freqeuncy delta when ramping up.
  * zero disables and causes to always jump straight to max frequency.
  */
-#define DEFAULT_RAMP_UP_STEP 350000
+#define DEFAULT_RAMP_UP_STEP 0
 static unsigned int ramp_up_step;
 
 /*
  * Freqeuncy delta when ramping down.
  * zero disables and will calculate ramp down according to load heuristic.
  */
-#define DEFAULT_RAMP_DOWN_STEP 160000
+#define DEFAULT_RAMP_DOWN_STEP 0
 static unsigned int ramp_down_step;
 
 /*
@@ -525,6 +525,7 @@ static void cpufreq_scaffold_freq_change_time_work(struct work_struct *work)
                         if (force_ramp_up && up_min_freq) {
                                 freq_new = up_min_freq;
                                 relation = CPUFREQ_RELATION_L;
+
                                 if (debug_mask & SCAFFOLD_DEBUG_GENERAL)
                                         printk(KERN_INFO 
                                                 "%s:%d: force_up=%d, "
@@ -533,16 +534,21 @@ static void cpufreq_scaffold_freq_change_time_work(struct work_struct *work)
                                                 force_ramp_up,
                                                 up_min_freq);
                         } else if (ramp_up_step) {
-                                freq_new = policy->cur + ramp_up_step;
+                                /* NOP case */
+                                //freq_new = policy->cur + ramp_up_step;
+                                freq_new = policy->max * cpu_load / 100;
                                 relation = CPUFREQ_RELATION_H;
+
                                 if (debug_mask & SCAFFOLD_DEBUG_GENERAL)
                                         printk(KERN_INFO
-                                                "%s:%d: ramp_up_step=%d",
+                                                "%s:%d: freq_new=%d "
+                                                "ramp_up_step=%d",
                                                 __FUNCTION__, __LINE__, 
-                                                ramp_up_step);
+                                                freq_new, ramp_up_step);
                         } else {
                                 freq_new = pcpu->max_speed;
                                 relation = CPUFREQ_RELATION_H;
+
                                 if (debug_mask & SCAFFOLD_DEBUG_GENERAL)
                                         printk(KERN_INFO
                                                 "%s:%d: up + else "
@@ -552,30 +558,39 @@ static void cpufreq_scaffold_freq_change_time_work(struct work_struct *work)
                         }
                 } else if (cpu_load < min_cpu_load) {
                         if (ramp_down_step)
+                                /* NOP case */
                                 freq_new = policy->cur - ramp_down_step;
                         else {
                                 // TODO why in the hell?
-                                cpu_load += 100 - max_cpu_load; // dummy load ?
-                                freq_new = policy->cur * cpu_load / 100;
+                                // cpu_load += 100 - max_cpu_load; // dummy load ?
+                                freq_new = policy->min;
+
                                 if (debug_mask & SCAFFOLD_DEBUG_GENERAL)
                                         printk(KERN_INFO "%s: freq_new: %d\n",
                                                 __FUNCTION__, freq_new);
                         } 
                         relation = CPUFREQ_RELATION_L;
                 } else {
-                        freq_new = policy->cur;
+                        /* Normal case: > min, < max */
+                        freq_new = policy->max * cpu_load / 100;
+
                         if (debug_mask & SCAFFOLD_DEBUG_GENERAL)
-                                printk(KERN_INFO "%s:%d: !up + else "
+                                printk(KERN_INFO "%s:%d: > min, < max "
                                         "freq_new=%d\n",
                                         __FUNCTION__, __LINE__, freq_new);
                 }
 
-                freq_new = validate_freq(pcpu, freq_new);
+                if (debug_mask & SCAFFOLD_DEBUG_JUMPS && 
+                        freq_new != policy->min &&
+                        freq_new != policy->max)
+                        printk(KERN_INFO "%s:%d: want to jump from %d to %d\n",
+                                __FUNCTION__, __LINE__, policy->cur, freq_new);
 
+                freq_new = validate_freq(pcpu, freq_new);
 
                 /* TODO CPUFREQ_RELATION_H ? */
                 if (cpufreq_frequency_table_target(pcpu->policy, pcpu->freq_table,
-                            freq_new, relation, &index)) {
+                            freq_new, CPUFREQ_RELATION_H, &index)) {
                         pr_warn_once("%s:%d: "
                                 "timer: cpufreq_frequency_table_target_error\n",
                                 __FUNCTION__, __LINE__);
