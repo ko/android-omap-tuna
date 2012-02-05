@@ -98,14 +98,14 @@ static unsigned int up_min_freq;
  * to minimize wakeup issues.
  * Set sleep_max_freq=0 to disable this behavior.
  */
-#define DEFAULT_SLEEP_MAX_FREQ 245760
+#define DEFAULT_SLEEP_MAX_FREQ 350000
 static unsigned int sleep_max_freq;
 
 /*
  * The frequency to set when waking up from sleep.
  * When sleep_max_freq=0 this will have no effect.
  */
-#define DEFAULT_SLEEP_WAKEUP_FREQ 998400 
+#define DEFAULT_SLEEP_WAKEUP_FREQ 920000
 static unsigned int sleep_wakeup_freq;
 
 /*
@@ -137,13 +137,13 @@ static unsigned int ramp_down_step;
 /*
  * CPU freq will be increased if measured load > max_cpu_load;
  */
-#define DEFAULT_MAX_CPU_LOAD 75
+#define DEFAULT_MAX_CPU_LOAD 95
 static unsigned long max_cpu_load;
 
 /*
  * CPU freq will be decreased if measured load < min_cpu_load;
  */
-#define DEFAULT_MIN_CPU_LOAD 25
+#define DEFAULT_MIN_CPU_LOAD 5
 static unsigned long min_cpu_load;
 
 /*
@@ -174,7 +174,7 @@ static unsigned long timer_rate;
 static int cpufreq_governor_scaffold(struct cpufreq_policy *policy,
 		unsigned int event);
 
-#ifndef CONFIG_CPU_FREQ_DEFAULT_GOV_scaffold
+#ifndef CONFIG_CPU_FREQ_DEFAULT_GOV_SCAFFOLD
 static
 #endif
 struct cpufreq_governor cpufreq_gov_scaffold = {
@@ -285,57 +285,73 @@ static void cpufreq_scaffold_timer(unsigned long data)
 
         pcpu->cur_cpu_load = cpu_load;
 
-        /* Scale up if load > max || if there were no idle cycles since
-         * coming out of idle || we are above our max speed for a very
-         * long time (should only happen if entering sleep at high loads)
+        /* CPU load is hella high or ridiculously busy. What we'll want is 
+         * for the CPU to be sped up to maximum frequency--no stepping.
          */
         if (cpu_load > max_cpu_load || delta_idle == 0) {
+                /* CPU is not greater than the maximum clock rate for a very
+                 * very long duration of time.
+                 */
                 if (!(policy->cur > pcpu->max_speed &&
                         cputime64_sub(pcpu->timer_run_time,
                                 pcpu->freq_change_time)
                         > 100 * down_rate_us)) {
-                        
-                    if (debug_mask & SCAFFOLD_DEBUG_GENERAL)
-                        printk(KERN_INFO "%s:%d: load=%d, max=%d, diff=%u\n",
-                                __FUNCTION__, __LINE__, cpu_load, max_cpu_load,
-                                (unsigned int)cputime64_sub(
+                            
+                        if (debug_mask & SCAFFOLD_DEBUG_GENERAL)
+                            printk(KERN_INFO "%s:%d: load=%d, max=%d, diff=%u\n",
+                                    __FUNCTION__, __LINE__, cpu_load, 
+                                    max_cpu_load, (unsigned int)cputime64_sub(
                                             pcpu->timer_run_time, 
                                             pcpu->freq_change_time));
 
-                    if (policy->cur > pcpu->max_speed)
-                            reset_timer(data, pcpu, timer_rate_jiffies);
+                        /* CPU frequency is greater than what it should be. 
+                         * Let's reset the timer and try again later.
+                         *
+                         * TODO does this make sense?
+                         */
+                        if (policy->cur > pcpu->max_speed)
+                                reset_timer(data, pcpu, timer_rate_jiffies);
 
-                    if (policy->cur == policy->max)
-                            goto exit;
+                        /* We are already at our max frequency. Break out and 
+                         * wait for the next time the kernel wakes up to check
+                         * the timer.
+                         */
+                        if (policy->cur == policy->max)
+                                goto exit;
 
-                    if (cputime64_sub(pcpu->timer_run_time, 
-                                    pcpu->freq_change_time) < up_rate_us) {
+                        /* Time that we've been at this frequency is less than 
+                         * the minimum required (up_rate_us) to raise the clock
+                         * speed. Let some time elapse and try again later.
+                         */
+                        if (cputime64_sub(pcpu->timer_run_time, 
+                                        pcpu->freq_change_time) < up_rate_us) {
 
-                            if (debug_mask & SCAFFOLD_DEBUG_GENERAL)
-                                printk(KERN_INFO "%s:%d: diff pre-exit: %u\n",
-                                        __FUNCTION__, __LINE__, (unsigned int)
-                                        cputime64_sub(pcpu->timer_run_time,
+                                if (debug_mask & SCAFFOLD_DEBUG_GENERAL)
+                                    printk(KERN_INFO "%s:%d: diff pre-exit: "
+                                            "%u\n", __FUNCTION__, __LINE__, 
+                                            (unsigned int)cputime64_sub(
+                                                    pcpu->timer_run_time,
                                                     pcpu->freq_change_time)
-                                );
+                                    );
 
-                            goto exit;
-                    }
+                                /* Just wait it out for jiffies to increase.
+                                 */
+                                goto exit;
+                        }
 
-                    pcpu->force_ramp_up = 1;
-                    cpumask_set_cpu(data, &work_cpumask);
-                    queue_work(up_wq, &freq_scale_work);
-                    goto exit;
+                        /* The CPU is ridiculously busy or past the threshold
+                         * load and these are the Cases that we haven't hit:
+                         *
+                         * 1. We've waited more than up_rate_us to do anything
+                         * 2. Current frequency is not max frequency
+                         */
+                        pcpu->force_ramp_up = 1;
+                        cpumask_set_cpu(data, &work_cpumask);
+                        queue_work(up_wq, &freq_scale_work);
+                        goto exit;
                 }
         }
 
-        if (policy->cur < pcpu->max_speed && !timer_pending(&pcpu->cpu_timer)) {
-            if (policy->cur == policy->min)
-                    if (pcpu->idling)
-                            goto exit;
-
-            reset_timer(data, pcpu, timer_rate_jiffies);
-        }
-            
         /* Do not scale down unless we have been at this frequency
          * for the minimum sample time.
          */
@@ -344,19 +360,12 @@ static void cpufreq_scaffold_timer(unsigned long data)
 
                 goto exit;
         }
-
         if (cputime64_sub(pcpu->timer_run_time, pcpu->freq_change_time)
                 < down_rate_us) {
-
-                if (debug_mask & SCAFFOLD_DEBUG_GENERAL)
-                        printk("%s: timer_run_time=%u, freq_change_time=%u\n",
-                                __FUNCTION__, 
-                                (unsigned int)pcpu->timer_run_time, 
-                                (unsigned int)pcpu->freq_change_time);
                 goto exit;
         }
 
-        /* Scale down only when there is something to scale down.
+        /* Force the CPU to minimum because we're below the threshold.
          */
         if (cpu_load < min_cpu_load) {
                 if (debug_mask & SCAFFOLD_DEBUG_GENERAL)
@@ -367,6 +376,14 @@ static void cpufreq_scaffold_timer(unsigned long data)
                 cpumask_set_cpu(data, &work_cpumask);
                 queue_work(down_wq, &freq_scale_work);
         }
+
+
+        /* We're somewhere in the middle of cpu_load ranges, now. 
+         * Just rearm the timer if we need to and let the governor
+         * function do its magic.
+         */
+
+
         /* There is a window where if the cpu utilization can go from
          * low to high between the timer expiring, delta_idle will be
          * > 0 and the cpu will be 100% busy, preventing idle from
@@ -514,6 +531,9 @@ static void cpufreq_scaffold_freq_change_time_work(struct work_struct *work)
                 if (!pcpu->governor_enabled)
                     continue;
 
+                /* Our cpu load is above the maximum threshold. Force the
+                 * maximum frequency for this cpu.
+                 */
                 if (force_ramp_up || cpu_load > max_cpu_load) {
                         if (debug_mask & SCAFFOLD_DEBUG_GENERAL)
                                 printk(KERN_INFO 
@@ -523,6 +543,10 @@ static void cpufreq_scaffold_freq_change_time_work(struct work_struct *work)
                                         cpu_load);
 
                         if (force_ramp_up && up_min_freq) {
+                                /* We want to force a ramping up to the maximum 
+                                 * cpu frequency but there's a minimum interval 
+                                 * to jump.
+                                 */
                                 freq_new = up_min_freq;
                                 relation = CPUFREQ_RELATION_L;
 
@@ -534,9 +558,11 @@ static void cpufreq_scaffold_freq_change_time_work(struct work_struct *work)
                                                 force_ramp_up,
                                                 up_min_freq);
                         } else if (ramp_up_step) {
-                                /* NOP case */
-                                //freq_new = policy->cur + ramp_up_step;
-                                freq_new = policy->max * cpu_load / 100;
+                                /* There is a ramping up interval but we're 
+                                 * also trying to force a ramp up to the
+                                 * max frequency.
+                                 */ 
+                                freq_new = policy->cur + ramp_up_step;
                                 relation = CPUFREQ_RELATION_H;
 
                                 if (debug_mask & SCAFFOLD_DEBUG_GENERAL)
@@ -546,6 +572,11 @@ static void cpufreq_scaffold_freq_change_time_work(struct work_struct *work)
                                                 __FUNCTION__, __LINE__, 
                                                 freq_new, ramp_up_step);
                         } else {
+                                /* There's no minimum interval of frequencies
+                                 * to jump by but we still want to get to the
+                                 * maximum frequency, so just set it to the
+                                 * top frequency available.
+                                 */
                                 freq_new = pcpu->max_speed;
                                 relation = CPUFREQ_RELATION_H;
 
@@ -557,10 +588,20 @@ static void cpufreq_scaffold_freq_change_time_work(struct work_struct *work)
                                                 freq_new);
                         }
                 } else if (cpu_load < min_cpu_load) {
+                        /* We're below the minimum load threshold so push the 
+                         * cpu to the minimum frequency available.
+                         */
                         if (ramp_down_step)
-                                /* NOP case */
+                                /* There's a step down interval, so let's
+                                 * use it here.
+                                 */
                                 freq_new = policy->cur - ramp_down_step;
                         else {
+                                /* There's no stepping down frequency available
+                                 * so let's just go to the minimum and be done
+                                 * with it.
+                                 */
+
                                 // TODO why in the hell?
                                 // cpu_load += 100 - max_cpu_load; // dummy load ?
                                 freq_new = policy->min;
@@ -574,10 +615,10 @@ static void cpufreq_scaffold_freq_change_time_work(struct work_struct *work)
                         /* Normal case: > min, < max */
                         freq_new = policy->max * cpu_load / 100;
 
-                        if (debug_mask & SCAFFOLD_DEBUG_GENERAL)
-                                printk(KERN_INFO "%s:%d: > min, < max "
-                                        "freq_new=%d\n",
-                                        __FUNCTION__, __LINE__, freq_new);
+                        if (debug_mask & SCAFFOLD_DEBUG_JUMPS)
+                                printk(KERN_INFO "%s:%d: cpu_load=%d, "
+                                        "freq_new=%d\n", __FUNCTION__, __LINE__, 
+                                        cpu_load, freq_new);
                 }
 
                 if (debug_mask & SCAFFOLD_DEBUG_JUMPS && 
@@ -588,7 +629,6 @@ static void cpufreq_scaffold_freq_change_time_work(struct work_struct *work)
 
                 freq_new = validate_freq(pcpu, freq_new);
 
-                /* TODO CPUFREQ_RELATION_H ? */
                 if (cpufreq_frequency_table_target(pcpu->policy, pcpu->freq_table,
                             freq_new, CPUFREQ_RELATION_H, &index)) {
                         pr_warn_once("%s:%d: "
@@ -1093,7 +1133,7 @@ static void cpufreq_scaffold_suspend(int cpu, int suspend)
                         printk(KERN_INFO "%s: waking up at %d\n", 
                                 __FUNCTION__, new_freq);
 
-                // TODO: CPUFREQ_RELATION_L == ?
+                // TODO: CPUFREQ_RELATION_L == LOW/HIGH ???
                 __cpufreq_driver_target(policy, new_freq, CPUFREQ_RELATION_L);
 
                 if (policy->cur < pcpu->max_speed 
@@ -1237,7 +1277,7 @@ err_freeuptask:
         return -ENOMEM;
 }
 
-#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_scaffold
+#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_SCAFFOLD
 fs_initcall(cpufreq_scaffold_init);
 #else
 module_init(cpufreq_scaffold_init);
