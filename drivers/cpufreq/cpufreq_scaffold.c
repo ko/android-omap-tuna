@@ -58,8 +58,8 @@ struct cpufreq_scaffold_cpuinfo {
 static DEFINE_PER_CPU(struct cpufreq_scaffold_cpuinfo, cpuinfo);
 
 /* Workqueues handle frequency scaling */
-static struct workqueue_struct *up_wq;
-static struct workqueue_struct *down_wq;
+static struct workqueue_struct *allcpu_wq;
+static struct workqueue_struct *percpu_wq;
 static struct work_struct freq_scale_work;
 static cpumask_t work_cpumask;
 static unsigned int suspended;
@@ -72,7 +72,7 @@ enum {
 };
 
 /* Combination of the above debug flags. */
-#define DEFAULT_DEBUG_MASK 1;
+#define DEFAULT_DEBUG_MASK 0;
 static unsigned long debug_mask;
 
 /* The minimum amount of time to spend at a frequency before we can ramp up. */
@@ -137,13 +137,13 @@ static unsigned int ramp_down_step;
 /*
  * CPU freq will be increased if measured load > max_cpu_load;
  */
-#define DEFAULT_MAX_CPU_LOAD 95
+#define DEFAULT_MAX_CPU_LOAD 90
 static unsigned long max_cpu_load;
 
 /*
  * CPU freq will be decreased if measured load < min_cpu_load;
  */
-#define DEFAULT_MIN_CPU_LOAD 5
+#define DEFAULT_MIN_CPU_LOAD 20
 static unsigned long min_cpu_load;
 
 /*
@@ -347,7 +347,7 @@ static void cpufreq_scaffold_timer(unsigned long data)
                          */
                         pcpu->force_ramp_up = 1;
                         cpumask_set_cpu(data, &work_cpumask);
-                        queue_work(up_wq, &freq_scale_work);
+                        queue_work(allcpu_wq, &freq_scale_work);
                         goto exit;
                 }
         }
@@ -374,7 +374,7 @@ static void cpufreq_scaffold_timer(unsigned long data)
                                 __FUNCTION__, __LINE__, cpu_load, 
                                 (unsigned int)min_cpu_load);
                 cpumask_set_cpu(data, &work_cpumask);
-                queue_work(down_wq, &freq_scale_work);
+                queue_work(percpu_wq, &freq_scale_work);
         }
 
 
@@ -382,7 +382,8 @@ static void cpufreq_scaffold_timer(unsigned long data)
          * Just rearm the timer if we need to and let the governor
          * function do its magic.
          */
-
+        cpumask_set_cpu(data, &work_cpumask);
+        queue_work(percpu_wq, &freq_scale_work);
 
         /* There is a window where if the cpu utilization can go from
          * low to high between the timer expiring, delta_idle will be
@@ -531,6 +532,14 @@ static void cpufreq_scaffold_freq_change_time_work(struct work_struct *work)
                 if (!pcpu->governor_enabled)
                     continue;
 
+                /* Overview debug messages */
+                if (debug_mask & SCAFFOLD_DEBUG_JUMPS)
+                        printk(KERN_INFO "%s:%d: cpu=%u, force_ramp_up=%d, "
+                               "cpu_load=%d, policy->cur=%d\n",
+                               __FUNCTION__, __LINE__, cpu, force_ramp_up,
+                               cpu_load, policy->cur
+                              ); 
+
                 /* Our cpu load is above the maximum threshold. Force the
                  * maximum frequency for this cpu.
                  */
@@ -612,8 +621,9 @@ static void cpufreq_scaffold_freq_change_time_work(struct work_struct *work)
                         } 
                         relation = CPUFREQ_RELATION_L;
                 } else {
-                        /* Normal case: > min, < max */
-                        freq_new = policy->max * cpu_load / 100;
+                        /* Normal case: Naive algorithm.
+                         * TODO: work on this in a bit.*/
+                        freq_new = policy->max * cpu_load / 75;
 
                         if (debug_mask & SCAFFOLD_DEBUG_JUMPS)
                                 printk(KERN_INFO "%s:%d: cpu_load=%d, "
@@ -629,15 +639,22 @@ static void cpufreq_scaffold_freq_change_time_work(struct work_struct *work)
 
                 freq_new = validate_freq(pcpu, freq_new);
 
+                /* freq_new is higher than the target frequency
+                 * (RELATION_H) so let's find the next frequency that's below
+                 * what we are after.
+                 */
                 if (cpufreq_frequency_table_target(pcpu->policy, pcpu->freq_table,
                             freq_new, CPUFREQ_RELATION_H, &index)) {
                         pr_warn_once("%s:%d: "
                                 "timer: cpufreq_frequency_table_target_error\n",
                                 __FUNCTION__, __LINE__);
                         // TODO get out ?
+                        printk(KERN_INFO "%s:%d: cpufreq_frequency_table_target"
+                                "has failed us\n", 
+                                __FUNCTION__, __LINE__);
                 }
 
-                freq_new= pcpu->freq_table[index].frequency;
+                freq_new = pcpu->freq_table[index].frequency;
 
                 if (freq_new != policy->cur) {
                         if (debug_mask & SCAFFOLD_DEBUG_JUMPS)
@@ -1239,8 +1256,8 @@ static int __init cpufreq_scaffold_init(void)
                 pcpu->cpu_timer.data = i;
         }
 
-        up_wq = alloc_ordered_workqueue("kscaffold_up", WQ_MEM_RECLAIM);
-        if (!up_wq)
+        allcpu_wq = alloc_ordered_workqueue("kscaffold_allcpu", WQ_MEM_RECLAIM);
+        if (!allcpu_wq)
                 goto err_freeuptask;
 
         /* No rescuer thread, bind to CPU queuing the work for possibly
@@ -1250,9 +1267,9 @@ static int __init cpufreq_scaffold_init(void)
            and really just serves as a context for the submission of tasks"
            [http://lwn.net/Articles/403891/]
          */
-        down_wq = alloc_workqueue("kscaffold_down", 0, 1);
+        percpu_wq = alloc_workqueue("kscaffold_percpu", 0, 1);
 
-        if (!down_wq)
+        if (!percpu_wq)
                 goto err_freeuptask;
 
         INIT_WORK(&freq_scale_work, cpufreq_scaffold_freq_change_time_work);
@@ -1273,7 +1290,7 @@ static int __init cpufreq_scaffold_init(void)
         return cpufreq_register_governor(&cpufreq_gov_scaffold);
 
 err_freeuptask:
-        destroy_workqueue(up_wq);
+        destroy_workqueue(allcpu_wq);
         return -ENOMEM;
 }
 
@@ -1293,8 +1310,8 @@ static void __exit cpufreq_scaffold_exit(void)
 	cpufreq_unregister_governor(&cpufreq_gov_scaffold);
     unregister_early_suspend(&cpufreq_scaffold_suspend_nb);
 
-    destroy_workqueue(up_wq);
-	destroy_workqueue(down_wq);
+    destroy_workqueue(allcpu_wq);
+	destroy_workqueue(percpu_wq);
 }
 
 module_exit(cpufreq_scaffold_exit);
