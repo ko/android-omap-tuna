@@ -1,0 +1,10 @@
+config AUDIT_FS
+	tristate "auditfs stackable file system (EXPERIMENTAL)"
+	depends on EXPERIMENTAL
+	help
+	  Auditfs is a stackable file system which logs filesystem 
+	  activity for auditing purposes.  It is based on wrapfs which is
+	  designed as a useful template for developing or debugging 
+	  other stackable file systems, and more 
+	  (see Documentation/filesystems/wrapfs.txt).  See
+	  <http://wrapfs.filesystems.org/> for details.

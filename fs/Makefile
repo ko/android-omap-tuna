@@ -125,8 +125,8 @@ obj-$(CONFIG_EXOFS_FS)          += exofs/
 obj-$(CONFIG_CEPH_FS)		+= ceph/
 obj-$(CONFIG_PSTORE)		+= pstore/
 
-# Pulled from WRAPFS tree
-obj-$(CONFIG_WRAP_FS)		+= wrapfs/
+# Pulled from AUDITFS tree
+obj-$(CONFIG_AUDIT_FS)		+= auditfs/
 
 # Patched by YAFFS
 obj-$(CONFIG_YAFFS_FS)		+= yaffs2/
